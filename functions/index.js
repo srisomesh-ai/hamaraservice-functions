@@ -1,16 +1,19 @@
-const functions = require("firebase-functions");
-const admin = require("firebase-admin");
+const {onValueWritten} = require("firebase-functions/v2/database");
+const {initializeApp} = require("firebase-admin/app");
+const {getDatabase} = require("firebase-admin/database");
+const {getMessaging} = require("firebase-admin/messaging");
 
-admin.initializeApp();
+initializeApp();
 
-// Trigger when a new booking is added to active_bookings
-exports.notifyProviders = functions.database
-  .ref("/active_bookings/{bookingId}")
-  .onWrite(async (change, context) => {
-    const bookingId = context.params.bookingId;
-    const booking = change.after.val();
+exports.notifyProviders = onValueWritten(
+  {
+    ref: "/active_bookings/{bookingId}",
+    region: "asia-southeast1",
+  },
+  async (event) => {
+    const bookingId = event.params.bookingId;
+    const booking = event.data.after.val();
 
-    // Only process searching bookings
     if (!booking || booking.status !== "searching") return null;
     if (booking.acceptedBy) return null;
 
@@ -19,8 +22,8 @@ exports.notifyProviders = functions.database
     const bookingLng = booking.lng || 0;
     const range = booking.range || 20;
 
-    // Get all providers
-    const providersSnap = await admin.database().ref("providers").once("value");
+    const db = getDatabase();
+    const providersSnap = await db.ref("providers").once("value");
     if (!providersSnap.exists()) return null;
 
     const providers = providersSnap.val();
@@ -31,17 +34,18 @@ exports.notifyProviders = functions.database
       if (provider.status !== "approved") continue;
       if (!provider.fcmToken) continue;
 
-      // Check service match
       const services = provider.services || [];
       const hasService = Array.isArray(services) && services.some((s) => {
-        const name = (s.name || s || "").toLowerCase();
+        const name = ((s && s.name) || s || "").toLowerCase();
         return name === svcName;
       });
       if (!hasService) continue;
 
-      // Check distance
       if (bookingLat && bookingLng && provider.lat && provider.lng) {
-        const dist = haversine(bookingLat, bookingLng, provider.lat, provider.lng);
+        const dist = haversine(
+          bookingLat, bookingLng,
+          provider.lat, provider.lng
+        );
         if (dist > range) continue;
       }
 
@@ -49,8 +53,8 @@ exports.notifyProviders = functions.database
       const message = {
         token: provider.fcmToken,
         notification: {
-          title: "🔔 New Booking Alert!",
-          body: `${booking.service} · ₹${amount} · ${booking.date || ""} ${booking.time || ""}`,
+          title: "New Booking Alert!",
+          body: `${booking.service} - Rs.${amount} - ${booking.date || ""} ${booking.time || ""}`,
         },
         data: {
           bookingId: bookingId,
@@ -73,16 +77,20 @@ exports.notifyProviders = functions.database
       };
 
       notifications.push(
-        admin.messaging().send(message).catch((err) => {
-          console.log(`Failed to send to ${providerId}:`, err.message);
+        getMessaging().send(message).catch((err) => {
+          console.log(`Failed to notify ${providerId}:`, err.message);
         })
       );
     }
 
-    await Promise.all(notifications);
-    console.log(`Notified ${notifications.length} providers for booking ${bookingId}`);
+    if (notifications.length > 0) {
+      await Promise.all(notifications);
+      console.log(`Notified ${notifications.length} providers for ${bookingId}`);
+    }
+
     return null;
-  });
+  }
+);
 
 function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371;
