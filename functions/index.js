@@ -9,6 +9,7 @@ exports.notifyProviders = onValueWritten(
   {
     ref: "/active_bookings/{bookingId}",
     region: "asia-southeast1",
+    instance: "hamaraservice-s009-default-rtdb",
   },
   async (event) => {
     const bookingId = event.params.bookingId;
