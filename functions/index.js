@@ -3,34 +3,53 @@ const {initializeApp} = require("firebase-admin/app");
 const {getDatabase} = require("firebase-admin/database");
 const {getMessaging} = require("firebase-admin/messaging");
 
-initializeApp();
+initializeApp({
+  databaseURL: "https://hamaraservice-s009-default-rtdb.asia-southeast1.firebasedatabase.app"
+});
 
 exports.notifyProviders = onValueWritten(
   {
     ref: "/active_bookings/{bookingId}",
     region: "asia-southeast1",
     instance: "hamaraservice-s009-default-rtdb",
+    database: "hamaraservice-s009-default-rtdb",
   },
   async (event) => {
     const bookingId = event.params.bookingId;
     const booking = event.data.after.val();
 
-    if (!booking || booking.status !== "searching") return null;
-    if (booking.acceptedBy) return null;
+    console.log(`Function triggered for booking: ${bookingId}`);
+    console.log(`Booking status: ${booking ? booking.status : 'null'}`);
+
+    if (!booking || booking.status !== "searching") {
+      console.log("Skipping - not a searching booking");
+      return null;
+    }
+    if (booking.acceptedBy) {
+      console.log("Skipping - already accepted");
+      return null;
+    }
 
     const svcName = (booking.service || "").toLowerCase();
     const bookingLat = booking.lat || 0;
     const bookingLng = booking.lng || 0;
     const range = booking.range || 20;
 
+    console.log(`Service: ${svcName}, Range: ${range}km`);
+
     const db = getDatabase();
     const providersSnap = await db.ref("providers").once("value");
-    if (!providersSnap.exists()) return null;
+    if (!providersSnap.exists()) {
+      console.log("No providers found");
+      return null;
+    }
 
     const providers = providersSnap.val();
     const notifications = [];
+    let checkedCount = 0;
 
     for (const [providerId, provider] of Object.entries(providers)) {
+      checkedCount++;
       if (!provider.available) continue;
       if (provider.status !== "approved") continue;
       if (!provider.fcmToken) continue;
@@ -51,6 +70,8 @@ exports.notifyProviders = onValueWritten(
       }
 
       const amount = booking.priceVal || booking.price || 0;
+      console.log(`Sending notification to provider: ${providerId}`);
+
       const message = {
         token: provider.fcmToken,
         notification: {
@@ -78,15 +99,16 @@ exports.notifyProviders = onValueWritten(
       };
 
       notifications.push(
-        getMessaging().send(message).catch((err) => {
-          console.log(`Failed to notify ${providerId}:`, err.message);
-        })
+        getMessaging().send(message)
+          .then(() => console.log(`Successfully notified ${providerId}`))
+          .catch((err) => console.log(`Failed to notify ${providerId}: ${err.message}`))
       );
     }
 
+    console.log(`Checked ${checkedCount} providers, sending ${notifications.length} notifications`);
+    
     if (notifications.length > 0) {
       await Promise.all(notifications);
-      console.log(`Notified ${notifications.length} providers for ${bookingId}`);
     }
 
     return null;
