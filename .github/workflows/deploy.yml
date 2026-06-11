@@ -22,7 +22,7 @@ jobs:
         run: cd functions && npm install
         
       - name: Delete old function
-        run: firebase functions:delete notifyProviders --region us-central1 --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
+        run: firebase functions:delete notifyProviders --region asia-southeast1 --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
         continue-on-error: true
         
       - name: Deploy Firebase Functions
