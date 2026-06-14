@@ -3,16 +3,15 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
 const { getMessaging } = require("firebase-admin/messaging");
-const { defineSecret } = require("firebase-functions/params");
 const https = require("https");
 
 initializeApp({
   databaseURL: "https://hamaraservice-s009-default-rtdb.asia-southeast1.firebasedatabase.app"
 });
 
-// Razorpay secrets — set via: firebase functions:secrets:set RAZORPAY_KEY_ID
-const RAZORPAY_KEY_ID     = defineSecret("RAZORPAY_KEY_ID");
-const RAZORPAY_KEY_SECRET = defineSecret("RAZORPAY_KEY_SECRET");
+// Razorpay keys — switch to live keys when going live
+const RAZORPAY_KEY_ID     = { value: () => "rzp_test_Sp87HrFA8UHblM" };
+const RAZORPAY_KEY_SECRET = { value: () => "FGo78kZC0992nb0Ug6nxNFB1" };
 
 const REGION = "asia-southeast1";
 const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
@@ -21,7 +20,7 @@ const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
 // 1. CREATE RAZORPAY ORDER (replaces create-order.php)
 // ═══════════════════════════════════════════════════════════
 exports.createOrder = onRequest(
-  { region: REGION, secrets: [RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET], cors: true },
+  { region: REGION, cors: true },
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
@@ -61,7 +60,7 @@ exports.createOrder = onRequest(
 // 2. VERIFY RAZORPAY PAYMENT (replaces verify-payment.php)
 // ═══════════════════════════════════════════════════════════
 exports.verifyPayment = onRequest(
-  { region: REGION, secrets: [RAZORPAY_KEY_SECRET], cors: true },
+  { region: REGION, cors: true },
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
