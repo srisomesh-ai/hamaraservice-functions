@@ -275,6 +275,7 @@ async function sendFCM(token, notification, data = {}) {
 
 function getNotificationContent(event, data) {
   const templates = {
+    admin_broadcast:           { title: data.title || "HamaraService", body: data.body || data.message || "You have a new message." },
     booking_accepted:          { title: "✅ Provider Accepted!", body: `${data.providerName || "Provider"} accepted your ${data.service || "booking"}.` },
     payment_received:          { title: "💰 Payment Received!", body: `₹${data.amount || 0} received for ${data.service || "service"}. Great work!` },
     otp_requested:             { title: "🔐 OTP Required", body: `Your OTP is ${data.otp || "----"}. Share with provider to complete service.` },
