@@ -10,8 +10,8 @@ initializeApp({
 });
 
 // Razorpay keys — switch to live keys when going live
-const RAZORPAY_KEY_ID     = { value: () => "rzp_test_Sp87HrFA8UHblM" };
-const RAZORPAY_KEY_SECRET = { value: () => "FGo78kZC0992nb0Ug6nxNFB1" };
+const RAZORPAY_KEY_ID     = "rzp_test_Sp87HrFA8UHblM";
+const RAZORPAY_KEY_SECRET = "FGo78kZC0992nb0Ug6nxNFB1";
 
 const REGION = "asia-southeast1";
 const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
@@ -31,8 +31,8 @@ exports.createOrder = onRequest(
     }
 
     const amountPaise = Math.round(Number(amount) * 100); // Razorpay uses paise
-    const keyId     = RAZORPAY_KEY_ID.value();
-    const keySecret = RAZORPAY_KEY_SECRET.value();
+    const keyId     = RAZORPAY_KEY_ID;
+    const keySecret = RAZORPAY_KEY_SECRET;
 
     const orderData = JSON.stringify({
       amount: amountPaise,
@@ -68,7 +68,7 @@ exports.verifyPayment = onRequest(
             booking_id, amount, provider_id, customer_id } = req.body;
 
     const crypto = require("crypto");
-    const keySecret = RAZORPAY_KEY_SECRET.value();
+    const keySecret = RAZORPAY_KEY_SECRET;
     const body = `${razorpay_order_id}|${razorpay_payment_id}`;
     const expectedSig = crypto.createHmac("sha256", keySecret).update(body).digest("hex");
 
@@ -307,8 +307,14 @@ function razorpayRequest(method, path, body, keyId, keySecret) {
       let data = "";
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error("Invalid JSON: " + data)); }
+        try {
+          const parsed = JSON.parse(data);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            reject(new Error(parsed.error?.description || parsed.error || JSON.stringify(parsed)));
+          }
+        } catch(e) { reject(new Error("Invalid JSON: " + data)); }
       });
     });
     req.on("error", reject);
