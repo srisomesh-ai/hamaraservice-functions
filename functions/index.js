@@ -103,13 +103,15 @@ exports.notifyBooking = onRequest(
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
-    const { event, fcmToken, data = {} } = req.body;
-    if (!event || !fcmToken) {
-      res.status(400).json({ error: "event and fcmToken required" });
+    const { event, fcmToken, title: directTitle, body: directBody, data = {} } = req.body;
+    if (!fcmToken) {
+      res.status(400).json({ error: "fcmToken is required" });
       return;
     }
-
-    const notification = getNotificationContent(event, data);
+    // Support direct title+body OR event-based
+    const notification = (directTitle && directBody)
+      ? { title: directTitle, body: directBody }
+      : getNotificationContent(event || "admin_broadcast", { ...data, title: directTitle, body: directBody });
     const message = {
       token: fcmToken,
       notification: { title: notification.title, body: notification.body },
