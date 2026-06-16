@@ -189,32 +189,71 @@ exports.onBookingChange = onValueWritten(
 // ═══════════════════════════════════════════════════════════
 async function notifyNearbyProviders(bookingId, booking) {
   const db = getDatabase();
+  const svcId   = booking.svcId   || "";   // e.g. "SVC001"
   const svcName = (booking.service || "").toLowerCase();
   const bookingLat = booking.lat || 0;
   const bookingLng = booking.lng || 0;
-  const range = booking.range || 20;
+  const range = booking.range || 50; // increased to 50km default
 
   const snap = await db.ref("providers").once("value");
-  if (!snap.exists()) return;
+  if (!snap.exists()) {
+    console.log("No providers found in database");
+    return;
+  }
 
   const sends = [];
+  let skipped = 0;
+
   for (const [pid, provider] of Object.entries(snap.val())) {
-    if (!provider.available || provider.status !== "approved" || !provider.fcmToken) continue;
-    const services = provider.services || [];
-    const hasService = Array.isArray(services) &&
-      services.some(s => ((s && s.name) || s || "").toLowerCase() === svcName);
-    if (!hasService) continue;
-    if (bookingLat && bookingLng && provider.lat && provider.lng) {
-      if (haversine(bookingLat, bookingLng, provider.lat, provider.lng) > range) continue;
+    // Must be available, approved, and have FCM token
+    if (!provider.available) { skipped++; continue; }
+    if (provider.status !== "approved") { skipped++; continue; }
+    if (!provider.fcmToken) { skipped++; continue; }
+
+    // Check if provider offers this service
+    // Services stored as object: { "SVC001": true, "SVC002": false }
+    // OR as array: ["SVC001", "SVC002"]
+    // OR empty (offer all services)
+    const services = provider.services;
+    if (services) {
+      let hasService = false;
+      if (Array.isArray(services)) {
+        // Array format — check by svcId or service name
+        hasService = svcId
+          ? services.includes(svcId)
+          : services.some(s => (s || "").toLowerCase() === svcName);
+      } else if (typeof services === "object") {
+        // Object format { "SVC001": true } — current format from provider app
+        hasService = svcId
+          ? services[svcId] === true
+          : Object.entries(services).some(([k,v]) => v === true && k.toLowerCase() === svcName);
+      }
+      // If provider has services defined but this service is not in it — skip
+      if (!hasService) { skipped++; continue; }
     }
+    // If provider.services is null/undefined — notify anyway (offers all)
+
+    // Distance check — skip if too far
+    if (bookingLat && bookingLng && provider.lat && provider.lng) {
+      const dist = haversine(bookingLat, bookingLng, provider.lat, provider.lng);
+      if (dist > range) { skipped++; continue; }
+    }
+
     const amount = booking.priceVal || booking.price || 0;
     sends.push(sendFCM(provider.fcmToken, {
       title: "🔔 New Job Alert!",
-      body: `${booking.service} · ₹${amount} · ${booking.address || ""}`,
-    }, { bookingId, type: "new_booking", amount: String(amount), service: booking.service || "" }));
+      body: `${booking.service || "New booking"} · ₹${amount} · ${booking.address || ""}`,
+    }, {
+      bookingId,
+      type: "new_booking",
+      amount: String(amount),
+      service: booking.service || "",
+      svcId: svcId,
+    }));
   }
+
   if (sends.length) await Promise.allSettled(sends);
-  console.log(`Notified ${sends.length} providers for booking ${bookingId}`);
+  console.log(`Booking ${bookingId}: notified ${sends.length} providers, skipped ${skipped}`);
 }
 
 async function notifyCustomerAccepted(bookingId, booking) {
