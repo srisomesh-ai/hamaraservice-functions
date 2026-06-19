@@ -210,28 +210,43 @@ async function notifyNearbyProviders(bookingId, booking) {
     if (provider.status !== "approved") { skipped++; continue; }
     if (!provider.fcmToken) { skipped++; continue; }
 
-    // Check if provider offers this service
-    // Services stored as object: { "SVC001": true, "SVC002": false }
-    // OR as array: ["SVC001", "SVC002"]
-    // OR empty (offer all services)
+    // Check if provider offers this service.
+    // Supports ALL storage formats from provider app:
+    // Format A: Array of objects  [{ name:"House Maid", id:"SVC001", ... }]  ← current provider app format
+    // Format B: Simple array      ["SVC001", "House Maid"]
+    // Format C: Object map        { "SVC001": true }
+    // Format D: null/undefined    → provider offers all services
     const services = provider.services;
     if (services) {
       let hasService = false;
       if (Array.isArray(services)) {
-        // Array format — check by svcId or service name
-        hasService = svcId
-          ? services.includes(svcId)
-          : services.some(s => (s || "").toLowerCase() === svcName);
+        hasService = services.some(s => {
+          if (s === null || s === undefined) return false;
+          if (typeof s === "string") {
+            // Format B — check by svcId or name
+            return (svcId && s === svcId) || s.toLowerCase() === svcName;
+          }
+          if (typeof s === "object") {
+            // Format A — array of {name, id, price, subRates}
+            const nameMatch = (s.name || "").toLowerCase() === svcName;
+            const idMatch   = svcId ? (s.id === svcId) : false;
+            return nameMatch || idMatch;
+          }
+          return false;
+        });
       } else if (typeof services === "object") {
-        // Object format { "SVC001": true } — current format from provider app
-        hasService = svcId
-          ? services[svcId] === true
-          : Object.entries(services).some(([k,v]) => v === true && k.toLowerCase() === svcName);
+        // Format C — { "SVC001": true }
+        if (svcId && services[svcId] !== undefined) {
+          hasService = services[svcId] === true;
+        } else {
+          hasService = Object.entries(services).some(([k, v]) =>
+            v === true && (k === svcId || k.toLowerCase() === svcName)
+          );
+        }
       }
-      // If provider has services defined but this service is not in it — skip
       if (!hasService) { skipped++; continue; }
     }
-    // If provider.services is null/undefined — notify anyway (offers all)
+    // null/undefined services → provider offers all, always notify
 
     // Distance check — skip if too far
     if (bookingLat && bookingLng && provider.lat && provider.lng) {
