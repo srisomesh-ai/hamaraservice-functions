@@ -308,23 +308,38 @@ async function notifyProviderPayment(bookingId, booking) {
 }
 
 async function sendFCM(token, notification, data = {}) {
+  // DATA-ONLY message — no notification block
+  // This ensures Flutter's background handler fires even when app is KILLED
+  // Flutter shows the notification itself via flutter_local_notifications
+  const allData = {
+    ...Object.fromEntries(Object.entries(data).map(([k,v]) => [k, String(v)])),
+    title: notification.title || "HamaraService",
+    body:  notification.body  || "You have a new update.",
+    click_action: "FLUTTER_NOTIFICATION_CLICK",
+    channel_id:   "hamaraservice_high_priority",
+  };
+
   return getMessaging().send({
     token,
-    notification,
-    data: Object.fromEntries(Object.entries(data).map(([k,v]) => [k, String(v)])),
+    // NO notification block — data only so Flutter handles it in background
+    data: allData,
     android: {
       priority: "high",
-      notification: {
-        channelId: "hamaraservice_high_priority",
-        sound: "default",
-        defaultVibrateTimings: true,
-        notificationPriority: "PRIORITY_MAX",
-        visibility: "PUBLIC",
-      },
+      ttl: 60 * 60 * 1000, // 1 hour TTL
+      restrictedPackageName: undefined,
     },
     apns: {
-      headers: { "apns-priority": "10" },
-      payload: { aps: { sound: "default", badge: 1, "content-available": 1 } },
+      headers: {
+        "apns-priority": "10",
+        "apns-push-type": "background",
+      },
+      payload: {
+        aps: {
+          "content-available": 1,
+          sound: "default",
+          badge: 1,
+        },
+      },
     },
   });
 }
@@ -339,6 +354,13 @@ function getNotificationContent(event, data) {
     booking_cancelled:         { title: "❌ Booking Cancelled", body: `Your ${data.service || "booking"} was cancelled.` },
     payout_approved:           { title: "✅ Payout Approved!", body: `Your withdrawal of ₹${data.amount || 0} has been approved.` },
     new_review:                { title: "⭐ New Review!", body: `You got a ${data.rating || 5}★ review for ${data.service || "service"}.` },
+    // Negotiation events
+    price_quoted:              { title: "💰 Provider Sent a Price!", body: `${data.providerName || "Provider"} quoted ₹${data.quotedPrice || 0} for your booking. Tap to view.` },
+    price_negotiation:         { title: "💬 Customer is Negotiating", body: data.counterPrice && data.counterPrice !== "0" ? `Customer countered with ₹${data.counterPrice}. Send your final offer.` : "Customer wants to negotiate. Respond now." },
+    negotiation_final:         { title: "💰 Final Price Offer!", body: `Provider's final price: ₹${data.finalPrice || 0}. Accept or search another provider.` },
+    price_confirmed:           { title: "✅ Price Confirmed!", body: `Booking confirmed at ₹${data.confirmedPrice || 0}. Proceed to service.` },
+    provider_declined:         { title: "🔍 Searching Another Provider", body: "Provider declined. We are searching for another provider for you." },
+    otp_verified:              { title: "✅ Job Completed!", body: `OTP verified. Please complete payment of ₹${data.amount || 0}.` },
   };
   return templates[event] || { title: "HamaraService", body: data.message || "You have a new update." };
 }
