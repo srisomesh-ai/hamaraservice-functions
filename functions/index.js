@@ -1,5 +1,6 @@
 const { onValueWritten } = require("firebase-functions/v2/database");
 const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
 const { getMessaging } = require("firebase-admin/messaging");
@@ -9,9 +10,11 @@ initializeApp({
   databaseURL: "https://hamaraservice-s009-default-rtdb.asia-southeast1.firebasedatabase.app"
 });
 
-// Razorpay keys — switch to live keys when going live
-const RAZORPAY_KEY_ID     = "rzp_test_Sp87HrFA8UHblM";
-const RAZORPAY_KEY_SECRET = "FGo78kZC0992nb0Ug6nxNFB1";
+// Razorpay keys live in Secret Manager — set them with:
+//   firebase functions:secrets:set RAZORPAY_KEY_ID
+//   firebase functions:secrets:set RAZORPAY_KEY_SECRET
+const RAZORPAY_KEY_ID     = defineSecret("RAZORPAY_KEY_ID");
+const RAZORPAY_KEY_SECRET = defineSecret("RAZORPAY_KEY_SECRET");
 
 const REGION = "asia-southeast1";
 const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
@@ -20,7 +23,7 @@ const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
 // 1. CREATE RAZORPAY ORDER (replaces create-order.php)
 // ═══════════════════════════════════════════════════════════
 exports.createOrder = onRequest(
-  { region: REGION, cors: true },
+  { region: REGION, cors: true, secrets: [RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET] },
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
@@ -31,8 +34,12 @@ exports.createOrder = onRequest(
     }
 
     const amountPaise = Math.round(Number(amount) * 100); // Razorpay uses paise
-    const keyId     = RAZORPAY_KEY_ID;
-    const keySecret = RAZORPAY_KEY_SECRET;
+    if (!Number.isFinite(amountPaise) || amountPaise < 100) {
+      res.status(400).json({ error: "invalid amount" });
+      return;
+    }
+    const keyId     = RAZORPAY_KEY_ID.value();
+    const keySecret = RAZORPAY_KEY_SECRET.value();
 
     const orderData = JSON.stringify({
       amount: amountPaise,
@@ -60,7 +67,7 @@ exports.createOrder = onRequest(
 // 2. VERIFY RAZORPAY PAYMENT (replaces verify-payment.php)
 // ═══════════════════════════════════════════════════════════
 exports.verifyPayment = onRequest(
-  { region: REGION, cors: true },
+  { region: REGION, cors: true, secrets: [RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET] },
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
@@ -68,29 +75,53 @@ exports.verifyPayment = onRequest(
             booking_id, amount, provider_id, customer_id } = req.body;
 
     const crypto = require("crypto");
-    const keySecret = RAZORPAY_KEY_SECRET;
+    const keyId     = RAZORPAY_KEY_ID.value();
+    const keySecret = RAZORPAY_KEY_SECRET.value();
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !booking_id ||
+        !/^[A-Za-z0-9_-]+$/.test(String(booking_id))) {
+      res.status(400).json({ verified: false, error: "missing or invalid fields" });
+      return;
+    }
     const body = `${razorpay_order_id}|${razorpay_payment_id}`;
     const expectedSig = crypto.createHmac("sha256", keySecret).update(body).digest("hex");
+    const sigOk = typeof razorpay_signature === "string" &&
+      razorpay_signature.length === expectedSig.length &&
+      crypto.timingSafeEqual(Buffer.from(razorpay_signature), Buffer.from(expectedSig));
 
-    if (expectedSig !== razorpay_signature) {
+    if (!sigOk) {
       console.log("Signature mismatch for booking:", booking_id);
       res.status(400).json({ verified: false, error: "Signature mismatch" });
       return;
     }
 
-    // Signature valid — update Firebase
-    const db = getDatabase();
     try {
+      // The order must have been created for this booking and actually be paid
+      const order = await razorpayRequest("GET", `/v1/orders/${encodeURIComponent(razorpay_order_id)}`, "", keyId, keySecret);
+      if (String(order.notes?.bookingId || "") !== String(booking_id)) {
+        res.status(400).json({ verified: false, error: "Order does not belong to this booking" });
+        return;
+      }
+      const payment = await razorpayRequest("GET", `/v1/payments/${encodeURIComponent(razorpay_payment_id)}`, "", keyId, keySecret);
+      if (payment.order_id !== razorpay_order_id ||
+          !["authorized", "captured"].includes(payment.status) ||
+          payment.amount !== order.amount) {
+        res.status(400).json({ verified: false, error: "Payment not valid for this order" });
+        return;
+      }
+
+      const db = getDatabase();
       const updates = {
         [`bookings/${booking_id}/paymentVerified`]: true,
         [`bookings/${booking_id}/razorpayPaymentId`]: razorpay_payment_id,
         [`bookings/${booking_id}/razorpayOrderId`]: razorpay_order_id,
+        [`bookings/${booking_id}/amountPaid`]: payment.amount / 100,
       };
       await db.ref().update(updates);
       console.log(`Payment verified for booking: ${booking_id}`);
-      res.json({ verified: true, booking_id });
+      res.json({ verified: true, booking_id, amount: payment.amount / 100 });
     } catch (err) {
-      res.status(500).json({ verified: false, error: err.message });
+      console.error("Payment verification error:", err);
+      res.status(500).json({ verified: false, error: "Verification failed" });
     }
   }
 );
@@ -103,19 +134,27 @@ exports.notifyBooking = onRequest(
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
 
-    const { event, fcmToken, title: directTitle, body: directBody, data = {} } = req.body;
-    if (!fcmToken) {
+    const { event, fcmToken, data = {} } = req.body;
+    if (!fcmToken || typeof fcmToken !== "string") {
       res.status(400).json({ error: "fcmToken is required" });
       return;
     }
-    // Support direct title+body OR event-based
-    const notification = (directTitle && directBody)
-      ? { title: directTitle, body: directBody }
-      : getNotificationContent(event || "admin_broadcast", { ...data, title: directTitle, body: directBody });
+    // This endpoint is unauthenticated, so only fixed templates are allowed —
+    // free-form title/body (and admin_broadcast) would make it an open spam relay.
+    if (!event || event === "admin_broadcast" || !NOTIFICATION_EVENTS.has(event)) {
+      res.status(400).json({ error: "unknown event" });
+      return;
+    }
+    const safeData = Object.fromEntries(
+      Object.entries(data && typeof data === "object" ? data : {})
+        .slice(0, 20)
+        .map(([k, v]) => [String(k).slice(0, 40), String(v).slice(0, 80)])
+    );
+    const notification = getNotificationContent(event, safeData);
     const message = {
       token: fcmToken,
       notification: { title: notification.title, body: notification.body },
-      data: Object.fromEntries(Object.entries({ ...data, event }).map(([k,v]) => [k, String(v)])),
+      data: { ...safeData, event },
       android: {
         priority: "high",
         notification: {
@@ -344,6 +383,12 @@ async function sendFCM(token, notification, data = {}) {
   });
 }
 
+const NOTIFICATION_EVENTS = new Set([
+  "booking_accepted", "payment_received", "otp_requested", "new_booking", "booking_cancelled",
+  "payout_approved", "new_review", "price_quoted", "price_negotiation", "negotiation_final",
+  "price_confirmed", "provider_declined", "otp_verified",
+]);
+
 function getNotificationContent(event, data) {
   const templates = {
     admin_broadcast:           { title: data.title || "HamaraService", body: data.body || data.message || "You have a new message." },
@@ -376,7 +421,7 @@ function razorpayRequest(method, path, body, keyId, keySecret) {
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Basic ${auth}`,
-        "Content-Length": Buffer.byteLength(body),
+        ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
       },
     };
     const req = https.request(options, (res) => {
@@ -394,7 +439,7 @@ function razorpayRequest(method, path, body, keyId, keySecret) {
       });
     });
     req.on("error", reject);
-    req.write(body);
+    if (body) req.write(body);
     req.end();
   });
 }
