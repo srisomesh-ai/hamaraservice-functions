@@ -22,4 +22,4 @@ jobs:
         run: cd functions && npm install
         
       - name: Deploy Firebase Functions
-        run: firebase deploy --only functions --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
+        run: firebase deploy --only functions,database --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force

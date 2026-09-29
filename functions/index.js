@@ -1,4 +1,3 @@
-const { onValueWritten } = require("firebase-functions/v2/database");
 const { onRequest } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const { initializeApp } = require("firebase-admin/app");
@@ -15,9 +14,11 @@ initializeApp({
 //   firebase functions:secrets:set RAZORPAY_KEY_SECRET
 const RAZORPAY_KEY_ID     = defineSecret("RAZORPAY_KEY_ID");
 const RAZORPAY_KEY_SECRET = defineSecret("RAZORPAY_KEY_SECRET");
+// Shared key the PHP API sends in X-HS-Notify-Key (NOTIFY_KEY in hs-config.php):
+//   firebase functions:secrets:set NOTIFY_KEY
+const NOTIFY_KEY = defineSecret("NOTIFY_KEY");
 
 const REGION = "asia-southeast1";
-const DB_INSTANCE = "hamaraservice-s009-default-rtdb";
 
 // ═══════════════════════════════════════════════════════════
 // 1. CREATE RAZORPAY ORDER (replaces create-order.php)
@@ -130,9 +131,19 @@ exports.verifyPayment = onRequest(
 // 3. SEND NOTIFICATION (replaces notify_booking.php)
 // ═══════════════════════════════════════════════════════════
 exports.notifyBooking = onRequest(
-  { region: REGION, cors: true },
+  { region: REGION, cors: false, secrets: [NOTIFY_KEY] },
   async (req, res) => {
     if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
+
+    // Only the PHP API may send pushes
+    const given = String(req.get("X-HS-Notify-Key") || "");
+    const expected = NOTIFY_KEY.value();
+    const crypto = require("crypto");
+    if (!expected || given.length !== expected.length ||
+        !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected))) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
 
     const { event, fcmToken, data = {} } = req.body;
     if (!fcmToken || typeof fcmToken !== "string") {
@@ -182,206 +193,6 @@ exports.notifyBooking = onRequest(
     }
   }
 );
-
-// ═══════════════════════════════════════════════════════════
-// 4. AUTO-NOTIFY ON BOOKING STATUS CHANGE (existing, improved)
-// ═══════════════════════════════════════════════════════════
-exports.onBookingChange = onValueWritten(
-  { ref: "/active_bookings/{bookingId}", region: REGION, instance: DB_INSTANCE },
-  async (event) => {
-    const bookingId = event.params.bookingId;
-    const after  = event.data.after.val();
-    const before = event.data.before.val();
-    if (!after) return null;
-
-    const db = getDatabase();
-
-    // New booking searching → notify nearby providers
-    if (after.status === "searching" && !after.acceptedBy &&
-        (!before || before.status !== "searching")) {
-      await notifyNearbyProviders(bookingId, after);
-    }
-
-    // Provider accepted → notify customer
-    if (after.status === "accepted" && (!before || before.status !== "accepted")) {
-      await notifyCustomerAccepted(bookingId, after);
-    }
-
-    // OTP sent → notify customer
-    if (after.status === "otp_sent" && (!before || before.status !== "otp_sent")) {
-      const otpSnap = await db.ref(`job_otp/${bookingId}`).once("value");
-      const otp = otpSnap.val()?.otp || "";
-      if (otp) await notifyCustomerOTP(bookingId, after, otp);
-    }
-
-    // Payment completed → notify provider
-    if (after.status === "completed" && (!before || before.status !== "completed")) {
-      await notifyProviderPayment(bookingId, after);
-    }
-
-    return null;
-  }
-);
-
-// ═══════════════════════════════════════════════════════════
-// NOTIFICATION HELPERS
-// ═══════════════════════════════════════════════════════════
-async function notifyNearbyProviders(bookingId, booking) {
-  const db = getDatabase();
-  const svcId   = booking.svcId   || "";   // e.g. "SVC001"
-  const svcName = (booking.service || "").toLowerCase();
-  const bookingLat = booking.lat || 0;
-  const bookingLng = booking.lng || 0;
-  const range = booking.range || 50; // increased to 50km default
-
-  const snap = await db.ref("providers").once("value");
-  if (!snap.exists()) {
-    console.log("No providers found in database");
-    return;
-  }
-
-  const sends = [];
-  let skipped = 0;
-
-  for (const [pid, provider] of Object.entries(snap.val())) {
-    // Must be available, approved, and have FCM token
-    if (!provider.available) { skipped++; continue; }
-    if (provider.status !== "approved") { skipped++; continue; }
-    if (!provider.fcmToken) { skipped++; continue; }
-
-    // Check if provider offers this service.
-    // Supports ALL storage formats from provider app:
-    // Format A: Array of objects  [{ name:"House Maid", id:"SVC001", ... }]  ← current provider app format
-    // Format B: Simple array      ["SVC001", "House Maid"]
-    // Format C: Object map        { "SVC001": true }
-    // Format D: null/undefined    → provider offers all services
-    const services = provider.services;
-    if (services) {
-      let hasService = false;
-      if (Array.isArray(services)) {
-        hasService = services.some(s => {
-          if (s === null || s === undefined) return false;
-          if (typeof s === "string") {
-            // Format B — check by svcId or name
-            return (svcId && s === svcId) || s.toLowerCase() === svcName;
-          }
-          if (typeof s === "object") {
-            // Format A — array of {name, id, price, subRates}
-            const nameMatch = (s.name || "").toLowerCase() === svcName;
-            const idMatch   = svcId ? (s.id === svcId) : false;
-            return nameMatch || idMatch;
-          }
-          return false;
-        });
-      } else if (typeof services === "object") {
-        // Format C — { "SVC001": true }
-        if (svcId && services[svcId] !== undefined) {
-          hasService = services[svcId] === true;
-        } else {
-          hasService = Object.entries(services).some(([k, v]) =>
-            v === true && (k === svcId || k.toLowerCase() === svcName)
-          );
-        }
-      }
-      if (!hasService) { skipped++; continue; }
-    }
-    // null/undefined services → provider offers all, always notify
-
-    // Distance check — skip if too far
-    if (bookingLat && bookingLng && provider.lat && provider.lng) {
-      const dist = haversine(bookingLat, bookingLng, provider.lat, provider.lng);
-      if (dist > range) { skipped++; continue; }
-    }
-
-    const amount = booking.priceVal || booking.price || 0;
-    sends.push(sendFCM(provider.fcmToken, {
-      title: "🔔 New Job Alert!",
-      body: `${booking.service || "New booking"} · ₹${amount} · ${booking.address || ""}`,
-    }, {
-      bookingId,
-      type: "new_booking",
-      amount: String(amount),
-      service: booking.service || "",
-      svcId: svcId,
-    }));
-  }
-
-  if (sends.length) await Promise.allSettled(sends);
-  console.log(`Booking ${bookingId}: notified ${sends.length} providers, skipped ${skipped}`);
-}
-
-async function notifyCustomerAccepted(bookingId, booking) {
-  const db = getDatabase();
-  const custSnap = await db.ref(`customers/${booking.customerId}/fcmToken`).once("value");
-  const token = custSnap.val();
-  if (!token) return;
-  const name = booking.providerName || booking.acceptedBy?.name || "Your provider";
-  await sendFCM(token, {
-    title: "✅ Provider Accepted!",
-    body: `${name} accepted your ${booking.service || "service"} booking. They're on the way!`,
-  }, { bookingId, type: "booking_accepted", providerName: name });
-}
-
-async function notifyCustomerOTP(bookingId, booking, otp) {
-  const db = getDatabase();
-  const custSnap = await db.ref(`customers/${booking.customerId}/fcmToken`).once("value");
-  const token = custSnap.val();
-  if (!token) return;
-  await sendFCM(token, {
-    title: "🔐 Share OTP to Complete",
-    body: `Your OTP is ${otp}. Share with provider to complete ${booking.service || "service"}.`,
-  }, { bookingId, type: "otp_requested", otp });
-}
-
-async function notifyProviderPayment(bookingId, booking) {
-  const db = getDatabase();
-  if (!booking.providerId) return;
-  const provSnap = await db.ref(`providers/${booking.providerId}/fcmToken`).once("value");
-  const token = provSnap.val();
-  if (!token) return;
-  const amount = booking.amountPaid || booking.priceVal || booking.price || 0;
-  await sendFCM(token, {
-    title: "💰 Payment Received!",
-    body: `₹${amount} received for ${booking.service || "service"}. Great work!`,
-  }, { bookingId, type: "payment_received", amount: String(amount) });
-}
-
-async function sendFCM(token, notification, data = {}) {
-  // DATA-ONLY message — no notification block
-  // This ensures Flutter's background handler fires even when app is KILLED
-  // Flutter shows the notification itself via flutter_local_notifications
-  const allData = {
-    ...Object.fromEntries(Object.entries(data).map(([k,v]) => [k, String(v)])),
-    title: notification.title || "HamaraService",
-    body:  notification.body  || "You have a new update.",
-    click_action: "FLUTTER_NOTIFICATION_CLICK",
-    channel_id:   "hamaraservice_high_priority",
-  };
-
-  return getMessaging().send({
-    token,
-    // NO notification block — data only so Flutter handles it in background
-    data: allData,
-    android: {
-      priority: "high",
-      ttl: 60 * 60 * 1000, // 1 hour TTL
-      restrictedPackageName: undefined,
-    },
-    apns: {
-      headers: {
-        "apns-priority": "10",
-        "apns-push-type": "background",
-      },
-      payload: {
-        aps: {
-          "content-available": 1,
-          sound: "default",
-          badge: 1,
-        },
-      },
-    },
-  });
-}
 
 const NOTIFICATION_EVENTS = new Set([
   "booking_accepted", "payment_received", "otp_requested", "new_booking", "booking_cancelled",
@@ -442,14 +253,4 @@ function razorpayRequest(method, path, body, keyId, keySecret) {
     if (body) req.write(body);
     req.end();
   });
-}
-
-// ── Haversine distance ────────────────────────────────────
-function haversine(lat1, lng1, lat2, lng2) {
-  const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLng = (lng2 - lng1) * Math.PI / 180;
-  const a = Math.sin(dLat/2)**2 +
-    Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
