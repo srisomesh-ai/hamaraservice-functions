@@ -21,9 +21,11 @@ jobs:
       - name: Install dependencies
         run: cd functions && npm install
         
-      - name: Delete old function
-        run: firebase functions:delete notifyProviders --region asia-southeast1 --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
-        continue-on-error: true
-        
-      - name: Deploy Firebase Functions
-        run: firebase deploy --only functions --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
+      - name: Syntax check
+        run: node --check functions/index.js
+
+      # --force also deletes functions that were removed from source
+      # (createOrder, verifyPayment, onBookingChange). Requires the secret
+      # HS_PUSH_KEY: firebase functions:secrets:set HS_PUSH_KEY
+      - name: Deploy Functions + locked-down DB/Storage rules
+        run: firebase deploy --only functions,database,storage --project hamaraservice-s009 --token "${{ secrets.FIREBASE_TOKEN }}" --force
